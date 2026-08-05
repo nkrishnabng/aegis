@@ -1,0 +1,574 @@
+// Prisma schema for the AI Test Automation Tool.
+//
+// Defaults to SQLite for zero-config local dev. To use PostgreSQL instead,
+// change `provider` below to "postgresql" and set DATABASE_URL to a Postgres
+// connection string -- no model changes are required.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  role         String   @default("member") // "admin" | "member"
+  createdAt    DateTime @default(now())
+
+  sessions              Session[]
+  testCases             TestCase[]           @relation("TestCaseOwner")
+  lastModifiedTestCases TestCase[]           @relation("TestCaseLastModifiedBy")
+  changeRequests        ChangeRequest[]
+  flows                 Flow[]               @relation("FlowOwner")
+  flowVersions          FlowVersion[]        @relation("FlowVersionAuthor")
+  projectMemberships    ProjectMember[]
+  auditLogEntries       AuditLogEntry[]
+  chatMessages          ChatMessage[]
+  agentActivityEvents   AgentActivityEvent[]
+}
+
+model Session {
+  id        String   @id
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  urls            TargetUrl[]
+  testCases       TestCase[]
+  chatMessages    ChatMessage[]
+  tokenUsages     TokenUsage[]
+  environments    Environment[]
+  integrations    Integration[]
+  flows           Flow[]
+  members         ProjectMember[]
+  auditLogEntries AuditLogEntry[]
+  activityEvents  AgentActivityEvent[]
+}
+
+// A durable, per-chat-turn timeline of what the agent is actually doing --
+// replaces the old ephemeral single-string "status" that was lost the moment
+// a client disconnected or the page refreshed. `turnId` groups every event
+// emitted by one chat.send call, in the order they happened; `stage` is one
+// of AGENT_TURN_STAGES (packages/shared). Append-only, never updated.
+// `userId` matches the chat turn's owner -- agent reasoning/activity is just
+// as private as the chat messages that triggered it, so listRecentActivity
+// always filters by both projectId and userId, same as ChatMessage.
+model AgentActivityEvent {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  turnId    String
+  stage     String
+  label     String
+  detail    String?
+  toolName  String?
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, userId])
+  @@index([turnId])
+}
+
+// Per-project membership + role -- "owner" (manage membership, credentials,
+// delete project), "editor" (create/edit/run/delete test cases, environments,
+// flows), "viewer" (read-only + run). A global admin (User.role === "admin")
+// bypasses this check entirely and is treated as "owner" everywhere, same as
+// today's "owner or admin" pattern on TestCase/Flow ownership. Existing
+// projects/users at the time this was introduced were backfilled with
+// "owner" rows (see this feature's migration) so nothing already using the
+// app loses access; new projects only auto-add their creator.
+model ProjectMember {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  role      String   @default("editor") // "owner" | "editor" | "viewer"
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([projectId])
+  @@index([userId])
+}
+
+// Durable record of who did what -- deliberately free-text `action`/`detail`
+// rather than a rigid enum+relation-per-action-type, since the set of
+// audit-worthy actions will keep growing and this is a read-mostly log, not
+// a queryable domain entity. userId/projectId SetNull on delete so removing
+// a user or project doesn't erase the historical record of what happened.
+model AuditLogEntry {
+  id         String   @id @default(cuid())
+  userId     String?
+  projectId  String?
+  action     String // e.g. "project.created", "member.added", "testcase.deleted"
+  targetType String?
+  targetId   String?
+  detail     String?
+  createdAt  DateTime @default(now())
+
+  user    User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@index([projectId])
+  @@index([userId])
+  @@index([action])
+}
+
+// A reusable, named sequence of steps (e.g. "Login as standard user") that
+// can be inserted into any test case in the project. Editing a flow never
+// silently changes test cases that already used it -- it creates a new
+// immutable FlowVersion instead; a test case that inserted an older version
+// keeps running exactly what it inserted until someone explicitly applies
+// the update (see TestStep.sourceFlowVersionId), the same "nothing changes
+// without an explicit action" pattern as HealingEvent/ChangeRequest.
+model Flow {
+  id          String   @id @default(cuid())
+  projectId   String
+  name        String
+  description String?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project   Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy User?         @relation("FlowOwner", fields: [createdById], references: [id], onDelete: SetNull)
+  versions  FlowVersion[]
+
+  @@unique([projectId, name])
+  @@index([projectId])
+}
+
+model FlowVersion {
+  id          String   @id @default(cuid())
+  flowId      String
+  version     Int // 1, 2, 3... increments per flow; immutable once created
+  steps       String // JSON-encoded TestStepInput[] (same shape as TestStep, no ids/testCaseId)
+  note        String? // optional changelog note for this version
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  flow      Flow       @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  createdBy User?      @relation("FlowVersionAuthor", fields: [createdById], references: [id], onDelete: SetNull)
+  usedBySteps TestStep[]
+
+  @@unique([flowId, version])
+  @@index([flowId])
+}
+
+model Environment {
+  id                   String   @id @default(cuid())
+  projectId            String
+  name                 String // e.g. "dev" | "qa" | "staging" | "prod" (free text)
+  baseUrl              String
+  browser              String   @default("chromium") // chromium | firefox | webkit
+  headless             Boolean  @default(true)
+  viewportWidth        Int      @default(1280)
+  viewportHeight       Int      @default(720)
+  credentialsEncrypted String? // AES-256-GCM JSON blob {iv, authTag, ciphertext}; never decrypted in API responses
+  isDefault            Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  project  Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  testRuns TestRun[]
+
+  @@index([projectId])
+}
+
+model TargetUrl {
+  id              String    @id @default(cuid())
+  projectId       String
+  url             String
+  title           String?
+  lastInspectedAt DateTime?
+
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  testCases TestCase[]
+
+  @@index([projectId])
+}
+
+// Private per-user chat: a message belongs to exactly one project AND one
+// user, never shared. listChatMessages always filters by both, so User A's
+// prompts/agent reasoning are never visible to User B even though they're
+// both members of the same project -- the project only shares *assets*
+// (TestCase and friends), never conversations. Cascade on user deletion
+// (unlike TestCase.createdBy's SetNull) since an orphaned private message
+// nobody could ever see again isn't worth keeping around.
+model ChatMessage {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  role      String // "user" | "assistant"
+  content   String
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, userId])
+}
+
+model TestCase {
+  id             String   @id @default(cuid())
+  projectId      String
+  urlId          String?
+  title          String
+  objective      String
+  preconditions  String
+  testData       String // JSON-encoded Record<string, unknown>
+  expectedResult String
+  priority       String // low | medium | high | critical
+  type           String // smoke | regression | functional | negative | ui
+  status         String   @default("draft") // draft | approved | archived
+  module         String? // free-text functional area tag, e.g. "Authentication" -- null shows as "Unassigned"
+  // The literal chat prompt that led the agent to propose this test case --
+  // captured once at creation (see propose_test_cases in agentService.ts),
+  // never edited. Null for test cases predating this field, or ones created
+  // some other way (e.g. an empty test case added directly). Turns a shared
+  // test case into its own documentation: another project member can see
+  // *why* it exists without needing access to the (private) chat that made
+  // it -- the prompt is asset metadata, not part of the private conversation.
+  sourcePrompt   String?
+  // JSON-encoded string[] -- free-form labels for search/filtering, editable
+  // like `module` (a single functional-area tag) but multi-valued.
+  tags           String   @default("[]")
+  // Bumped on every applyTestCaseUpdate -- a lightweight "this has changed N
+  // times" counter, not full diffable history (unlike Flow/FlowVersion,
+  // there's no snapshot-per-version storage here; see lastModifiedBy +
+  // updatedAt for "what/when" and the audit log for security-relevant
+  // changes specifically).
+  version        Int      @default(1)
+  createdById    String?
+  lastModifiedById String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  project        Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  url            TargetUrl?      @relation(fields: [urlId], references: [id], onDelete: SetNull)
+  createdBy      User?           @relation("TestCaseOwner", fields: [createdById], references: [id], onDelete: SetNull)
+  lastModifiedBy User?           @relation("TestCaseLastModifiedBy", fields: [lastModifiedById], references: [id], onDelete: SetNull)
+  steps          TestStep[]
+  testRuns       TestRun[]
+  changeRequests ChangeRequest[]
+  dataSet        TestDataSet?
+
+  @@index([projectId])
+  @@index([urlId])
+  @@index([createdById])
+}
+
+// A CSV/JSON-imported data table for data-driven runs of one test case. One
+// dataset per test case (replaced wholesale on re-upload, not versioned --
+// versioning/reuse across test cases is a separate future feature). Step
+// values reference a column via `{{data.COLUMN}}`, resolved per-row at
+// execution time the same way `{{env.KEY}}` resolves credentials.
+// `secretColumns` names the subset of `columns` that must never appear in
+// plaintext in a TestRunResult's stored/displayed text or in an exported
+// spec -- same sensitivity class as Environment credentials.
+model TestDataSet {
+  id            String   @id @default(cuid())
+  testCaseId    String   @unique
+  columns       String // JSON-encoded string[], in order
+  secretColumns String // JSON-encoded string[], subset of columns
+  rows          String // JSON-encoded Record<string, string>[]
+  source        String // "csv" | "json" -- how it was imported, for display only
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  testCase TestCase @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+}
+
+model TestStep {
+  id                 String  @id @default(cuid())
+  testCaseId         String
+  order              Int
+  action             String
+  selector           String? // JSON-encoded ElementSelector (primary)
+  locatorCandidates  String? // JSON-encoded ElementSelector[] (alternates, tried before LLM recovery)
+  value              String?
+  description        String
+  enabled            Boolean @default(true)
+  // Set when this step was materialized by inserting a Flow's steps into the
+  // test case -- provenance only, not a live reference the executor/exporter
+  // need to resolve (this step is a normal, concrete TestStep either way).
+  // Lets the editor detect "a newer version of this flow exists" and offer
+  // an explicit (never automatic) update. SetNull on flow-version delete so
+  // deleting a flow never corrupts a test case that already used it.
+  sourceFlowVersionId String?
+
+  testCase        TestCase          @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+  sourceFlowVersion FlowVersion?     @relation(fields: [sourceFlowVersionId], references: [id], onDelete: SetNull)
+  results         TestRunResult[]
+  healingEvents   HealingEvent[]
+  visualBaseline  VisualBaseline?
+  visualDiffs     VisualDiff[]
+
+  @@index([testCaseId])
+  @@index([sourceFlowVersionId])
+}
+
+model TestRun {
+  id            String    @id @default(cuid())
+  testCaseId    String
+  environmentId String?
+  status        String // pending | running | passed | failed | error
+  triggeredBy   String    @default("user") // "user" | "rerun" | "batch"
+  batchId       String?
+  // Real Playwright trace (.trace) / video (.webm) files captured via the
+  // Playwright MCP devtools-capability tools (browser_start/stop_tracing,
+  // browser_start/stop_video). Null when capture failed or wasn't supported
+  // by the session's browser -- the "Trace" tab falls back to its
+  // reconstructed timeline in that case.
+  tracePath     String?
+  videoPath     String?
+  // Opt-in: this run's browser session was seeded with the project's chat
+  // exploration session's storage state (cookies/localStorage) before its
+  // first step, e.g. to skip re-login if chat already authenticated.
+  continuedFromChat Boolean @default(false)
+  // Set when this run was started via "rerun from step N": steps before
+  // resumedFromStepOrder were NOT re-executed/re-verified this run -- their
+  // outcome is inherited from resumedFromRunId (see resumedFrom in the API
+  // layer). The browser session was seeded with the storage state + URL
+  // captured after the last inherited step instead.
+  resumedFromRunId     String?
+  resumedFromStepOrder Int?
+  // Which row of the TestCase's TestDataSet this run used (data-driven
+  // "run with data"). Null for a normal (non-data-driven) run.
+  dataRowIndex  Int?
+  startedAt     DateTime  @default(now())
+  finishedAt    DateTime?
+
+  testCase    TestCase        @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+  environment Environment?    @relation(fields: [environmentId], references: [id], onDelete: SetNull)
+  results     TestRunResult[]
+  logs        ExecutionLog[]
+  issuePushes IssuePush[]
+
+  @@index([testCaseId])
+  @@index([environmentId])
+}
+
+model TestRunResult {
+  id           String  @id @default(cuid())
+  testRunId    String
+  testStepId   String
+  stepOrder    Int
+  // Snapshotted from TestStep.action at run time (same reasoning as
+  // stepOrder above: a step can be edited/reordered after a run, so a past
+  // result should keep reflecting what actually ran, not the step's current
+  // definition). Nullable only because rows created before this column
+  // existed have no value to backfill.
+  action       String?
+  status       String // pending | running | passed | failed | error
+  actualResult String?
+  errorMessage String?
+  suggestedFix String?
+  recovered    Boolean @default(false)
+  durationMs   Int     @default(0)
+  // Captured (best-effort) after this step passes, via browser_storage_state --
+  // used only server-side to seed a later "rerun from step N" session; never
+  // returned by the API (it's cookie/session data, same sensitivity class as
+  // Environment credentials).
+  storageStateJson String?
+  // The page URL right after this step, captured via browser_evaluate --
+  // used to re-navigate a resumed run's session to the right place before
+  // continuing from the inherited state above.
+  pageUrl          String?
+
+  testRun       TestRun        @relation(fields: [testRunId], references: [id], onDelete: Cascade)
+  testStep      TestStep       @relation(fields: [testStepId], references: [id], onDelete: Cascade)
+  screenshots   Screenshot[]
+  healingEvents HealingEvent[]
+  visualDiffs   VisualDiff[]
+
+  @@index([testRunId])
+  @@index([testStepId])
+}
+
+// The current accepted-appearance screenshot for an `assertVisualMatch` step
+// -- one per step. Replaced only when a pending VisualDiff is explicitly
+// approved (see VisualDiff), never automatically.
+model VisualBaseline {
+  id         String   @id @default(cuid())
+  testStepId String   @unique
+  filePath   String // relative to VISUAL_REGRESSION_DIR
+  width      Int
+  height     Int
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  testStep TestStep @relation(fields: [testStepId], references: [id], onDelete: Cascade)
+
+  @@index([testStepId])
+}
+
+// A pixel-diff beyond threshold between an `assertVisualMatch` run's
+// screenshot and the step's current baseline -- durable, human-reviewable
+// record (same "nothing applied without an explicit action" pattern as
+// HealingEvent/ChangeRequest). Approving promotes `actualPath` to be the new
+// VisualBaseline; rejecting leaves the baseline as-is.
+model VisualDiff {
+  id              String    @id @default(cuid())
+  testStepId      String
+  testRunResultId String
+  baselinePath    String // the baseline as it was at diff time
+  actualPath      String
+  diffPath        String // pixelmatch highlight image (or == actualPath on a dimension mismatch)
+  diffPercent     Float
+  status          String    @default("pending") // pending | approved | rejected
+  createdAt       DateTime  @default(now())
+  resolvedAt      DateTime?
+
+  testStep      TestStep      @relation(fields: [testStepId], references: [id], onDelete: Cascade)
+  testRunResult TestRunResult @relation(fields: [testRunResultId], references: [id], onDelete: Cascade)
+
+  @@index([testStepId])
+  @@index([status])
+}
+
+model HealingEvent {
+  id              String   @id @default(cuid())
+  testStepId      String
+  testRunResultId String
+  oldSelector     String // JSON-encoded ElementSelector
+  newSelector     String // JSON-encoded ElementSelector
+  confidence      String // "high" | "low"
+  note            String
+  screenshotId    String?
+  approved        Boolean  @default(false)
+  dismissed       Boolean  @default(false)
+  createdAt       DateTime @default(now())
+
+  testStep      TestStep      @relation(fields: [testStepId], references: [id], onDelete: Cascade)
+  testRunResult TestRunResult @relation(fields: [testRunResultId], references: [id], onDelete: Cascade)
+
+  @@index([testStepId])
+  @@index([testRunResultId])
+}
+
+model Screenshot {
+  id              String   @id @default(cuid())
+  testRunResultId String
+  stepOrder       Int
+  filePath        String
+  takenAt         DateTime @default(now())
+
+  testRunResult TestRunResult @relation(fields: [testRunResultId], references: [id], onDelete: Cascade)
+
+  @@index([testRunResultId])
+}
+
+model TokenUsage {
+  id               String   @id @default(cuid())
+  projectId        String
+  source           String // "chat" (and, in future, other Anthropic call sites)
+  model            String
+  inputTokens      Int
+  outputTokens     Int
+  cacheReadTokens  Int
+  cacheWriteTokens Int
+  costUsd          Float
+  createdAt        DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+// A non-owner flagging an issue on a test case, for the owner to act on --
+// mirrors the HealingEvent pattern (durable, human-reviewable queue) rather
+// than firing an external notification.
+model ChangeRequest {
+  id            String    @id @default(cuid())
+  testCaseId    String
+  requestedById String
+  note          String
+  status        String    @default("open") // open | resolved
+  createdAt     DateTime  @default(now())
+  resolvedAt    DateTime?
+
+  testCase    TestCase @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+  requestedBy User     @relation(fields: [requestedById], references: [id], onDelete: Cascade)
+
+  @@index([testCaseId])
+  @@index([status])
+}
+
+model ExecutionLog {
+  id        String   @id @default(cuid())
+  testRunId String
+  level     String // info | warn | error
+  category  String   @default("execution") // execution | console | network
+  message   String
+  timestamp DateTime @default(now())
+
+  testRun TestRun @relation(fields: [testRunId], references: [id], onDelete: Cascade)
+
+  @@index([testRunId])
+}
+
+// Per-project issue-tracker connection config. `type` is "jira" for the real
+// adapter today; "githubIssues"/"azureDevOps" are reserved for the mock
+// adapter (see src/integrations) so the interface is provably extensible
+// without a real implementation yet. Credentials follow the same
+// AES-256-GCM-at-rest, never-in-API-responses pattern as Environment.
+model Integration {
+  id                String   @id @default(cuid())
+  projectId         String
+  type              String // "jira" | "githubIssues" | "azureDevOps"
+  baseUrl           String
+  email             String
+  projectKey        String
+  apiTokenEncrypted String // AES-256-GCM JSON blob {iv, authTag, ciphertext}; never decrypted in API responses
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, type])
+  @@index([projectId])
+}
+
+// Durable record of whether a given TestRun's failure has already been
+// pushed to an external issue tracker (Jira, GitHub Issues, or Azure
+// DevOps) -- same "reviewable record, not a notification" pattern as
+// HealingEvent/ChangeRequest. One row per (testRunId, type) push attempt; a
+// "pushed" row makes a repeat push idempotent (returns the existing issue
+// instead of creating a duplicate). Model/table name kept as JiraPush
+// (@@map) for historical reasons -- it predates multi-tracker support and
+// renaming the physical table isn't worth the migration risk.
+model IssuePush {
+  id           String    @id @default(cuid())
+  testRunId    String
+  type         String    @default("jira") // "jira" | "githubIssues" | "azureDevOps"
+  status       String    @default("pending") // pending | pushed | failed
+  issueKey     String?   @map("jiraIssueKey")
+  issueUrl     String?   @map("jiraIssueUrl")
+  errorMessage String?
+  createdAt    DateTime  @default(now())
+  pushedAt     DateTime?
+
+  testRun TestRun @relation(fields: [testRunId], references: [id], onDelete: Cascade)
+
+  @@index([testRunId])
+  @@index([status])
+  @@map("JiraPush")
+}

@@ -1,0 +1,83 @@
+name: Run AegisQA test cases
+
+# Sample workflow: runs every approved test case for one project against a
+# running instance of this app's own backend, on every PR. It does NOT export
+# and run tests standalone -- for that, see `GET /api/projects/:id/export-ci`
+# (downloads a zip runnable via `npx playwright test` with no app instance
+# needed at all) and adapt this workflow's "Run tests" step accordingly.
+#
+# Required repository secrets:
+#   ANTHROPIC_API_KEY          - passed straight through to the backend's .env
+#   CREDENTIAL_ENCRYPTION_KEY  - required before Environment credentials can be
+#                                 read; generate with:
+#                                 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+#   CI_USERNAME / CI_PASSWORD  - a login this workflow uses to trigger runs
+#                                 (create a dedicated CI user via the Admin
+#                                 page, or reuse ADMIN_USERNAME/ADMIN_PASSWORD)
+#   CI_PROJECT_ID              - the id of the project whose approved test
+#                                 cases this workflow should run
+#   AEGISQA_ENV_*              - any {{env.KEY}} credential values referenced
+#                                 by that project's test steps (see below)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build (shared -> backend -> frontend)
+        run: npm run build
+
+      - name: Write backend .env
+        # The backend reads its .env from packages/backend/.env (its own cwd
+        # when run via the npm workspace scripts), not the repo root -- see
+        # CLAUDE.md. Add one `echo` line per {{env.KEY}} credential your
+        # project's test steps reference, mapped from its own repo secret.
+        run: |
+          cat >> packages/backend/.env <<EOF
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          CREDENTIAL_ENCRYPTION_KEY=${{ secrets.CREDENTIAL_ENCRYPTION_KEY }}
+          PLAYWRIGHT_HEADLESS=true
+          EOF
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Apply database migrations
+        run: npm run prisma:migrate --workspace packages/backend
+
+      - name: Start backend
+        run: npm run start --workspace packages/backend &
+        env:
+          NODE_ENV: production
+
+      - name: Wait for backend to be ready
+        run: npx wait-on http://localhost:4000/api/auth/me -t 30000 || true
+        # `/api/auth/me` 401s when unauthenticated, which is fine -- wait-on
+        # only needs the port to accept connections.
+
+      - name: Run approved test cases
+        run: |
+          npm run ci:run-tests --workspace packages/backend -- \
+            --project "${{ secrets.CI_PROJECT_ID }}" \
+            --base-url http://localhost:4000 \
+            --username "${{ secrets.CI_USERNAME }}" \
+            --password "${{ secrets.CI_PASSWORD }}"
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-results
+          path: packages/backend/junit-results.xml
